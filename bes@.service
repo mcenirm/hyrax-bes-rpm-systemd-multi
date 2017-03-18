@@ -1,0 +1,29 @@
+[Unit]
+Description=Hyrax BES for %I
+Documentation=http://docs.opendap.org/index.php/Hyrax
+Wants=network-online.target
+After=network-online.target
+
+[Install]
+WantedBy=multi-user.target
+
+[Service]
+Group=bes
+User=bes
+WorkingDirectory=/var/log/bes-%I
+Type=simple
+StandardOutput=journal
+StandardError=inherit
+ExecStart=/usr/bin/beslistener -c /etc/bes-%I/bes.conf -r /var/run/bes-%I -d 'cerr,all'
+
+# Disable timeout logic and wait until process is stopped
+#TimeoutStopSec=0
+
+# SIGTERM signal is used to stop the Java process
+#KillSignal=SIGTERM
+
+# Java process is never killed
+#SendSIGKILL=no
+
+# When a JVM receives a SIGTERM signal it exits with code 143
+#SuccessExitStatus=143
