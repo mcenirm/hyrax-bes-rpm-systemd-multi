@@ -1,0 +1,182 @@
+#!/bin/bash
+
+set -e
+set -u
+
+Usage () { cat >&2 <<EOF
+Usage: $0 SETTINGS
+Prepare a separate Hyrax environment (BES + OLFS)
+Where:
+  SETTINGS    path to file with settings
+Example settings file:
+bes_instance_name=example_dev
+bes_instance_port=10020
+bes_catalog_root=/data/dev/example
+olfs_war_file=/tmp/olfs-1.16.2-webapp/opendap.war
+tomcat_instance_name=exampledev
+EOF
+}
+
+
+if [ $# -ne 1 ] ; then
+  Usage
+  exit 1
+fi
+
+if [ ! -r "$1" ] ; then
+  echo >&2 "Cannot read settings file: $1"
+  Usage
+  exit 1
+fi
+
+. "$1"
+
+
+main () {
+  if ! check_requirements ; then
+    exit 1
+  fi
+  prepare_bes_configuration
+  prepare_olfs_configuration
+}
+
+
+check_requirements () {
+  local passed=true
+  local cmds=(
+    'systemctl (Wrong Linux distribution?)'
+    'install (from RPM coreutils)'
+    rsync
+    'xmlstarlet (from EPEL)'
+    'jar (from RPM java-*-devel)'
+  )
+  local rpms=(
+    bes
+    tomcat
+  )
+
+  local cmdx
+  for cmdx in "${cmds[@]}" ; do
+    local cmd=${cmdx%% *}
+    if ! command -v "$cmd" >/dev/null ; then
+      echo >&2 "Missing requirement: $cmdx"
+      passed=false
+    fi
+  done
+
+  local rpm
+  for rpm in "${rpms[@]}" ; do
+    if ! rpm --quiet -q "$rpm" ; then
+      echo >&2 "Missing requirement: RPM $rpm"
+      passed=false
+    fi
+  done
+
+  if [ ! -r "$olfs_war_file" ] ; then
+    echo >&2 "Missing requirement: OLFS opendap.war"
+    passed=false
+  fi
+
+  if [ ! -r /etc/systemd/system/bes@.service ] ; then
+    echo >&2 "Missing requirement: BES systemd unit file"
+    passed=false
+  fi
+
+  if [ ! -d /var/lib/tomcats/"$tomcat_instance_name"/webapps ] ; then
+    echo >&2 "Missing requirement: tomcat instance $tomcat_instance_name"
+    passed=false
+  fi
+
+  "$passed"
+}
+
+
+prepare_bes_configuration () {
+  install -v -o root -g root -m 0755 -d /etc/bes-"$bes_instance_name"
+  install -v -o bes -g bes -m 0775 -d /var/{cache,log}/bes-"$bes_instance_name"
+  if [ ! -d /etc/bes-"$bes_instance_name"/modules ] ; then
+    rsync -av /etc/bes/modules/ /etc/bes-"$bes_instance_name"/modules/
+  fi
+  cp -v -p /etc/bes/bes.conf /etc/bes-"$bes_instance_name"/bes.conf
+  sed -i \
+      -e "s=^\(BES\.LogName\) *\=.*\$=\1\=/var/log/bes-${bes_instance_name}/bes.log=" \
+      -e "s=^\(BES\.UncompressCache\.dir\) *\=.*\$=\1\=/var/cache/bes-${bes_instance_name}=" \
+      -e "s=^\(BES\.Catalog\.catalog\.RootDirectory\) *\=.*\$=\1\=${bes_catalog_root}=" \
+      -e "s=^\(BES\.Data\.RootDirectory\) *\=.*\$=\1\=/dev/null=" \
+      -e "s=^\(BES\.ServerPort\) *\=.*\$=\1\=${bes_instance_port}=" \
+      -e "s=^# \(BES\.ServerIP\) *\=.*\$=\1\=127.0.0.1=" \
+      -- /etc/bes-"$bes_instance_name"/bes.conf
+
+  cat > /etc/logrotate.d/bes-"$bes_instance_name" <<EOF
+/var/log/bes-${bes_instance_name}/*log {
+    su bes bes
+    daily
+    rotate 8
+    missingok
+    notifempty
+    sharedscripts
+    compress
+    delaycompress
+    postrotate
+        /usr/bin/systemctl stop tomcat@${tomcat_instance_name}
+        /usr/bin/systemctl stop bes@${bes_instance_name}
+        /usr/bin/sleep 5
+        /usr/bin/systemctl start bes@${bes_instance_name}
+        /usr/bin/systemctl start tomcat@${tomcat_instance_name}
+    endscript
+}
+EOF
+  restorecon -vF /etc/logrotate.d/bes-"$bes_instance_name"
+
+  systemctl enable bes@"$bes_instance_name"
+}
+
+
+prepare_olfs_configuration () {
+  local tomcat_sysconfig=/etc/sysconfig/tomcat@${tomcat_instance_name}
+  local tomcat_base=/var/lib/tomcats/${tomcat_instance_name}
+  local tomcat_content_dir=${tomcat_base}/content
+  local olfs_config_dir=${tomcat_content_dir}/opendap
+  local tomcat_webapps=${tomcat_base}/webapps
+  local olfs_webapp_dir=${tomcat_webapps}/opendap
+  local olfs_webapp_file=${olfs_webapp_dir}.war
+
+  systemctl stop tomcat@"$tomcat_instance_name".service
+
+  rm -rf -- "$olfs_webapp_dir" "$olfs_webapp_file"
+  install -v -o tomcat -g tomcat -m 0644 -p -T "$olfs_war_file" "$olfs_webapp_file"
+
+  if [ ! -f "$tomcat_sysconfig" ] ; then
+    touch -- "$tomcat_sysconfig"
+  fi
+  if ! grep -q -e '^#* *OLFS_CONFIG_DIR=' -- "$tomcat_sysconfig" ; then
+    echo '#OLFS_CONFIG_DIR=...' >> "$tomcat_sysconfig"
+  fi
+  sed -i \
+      -e "s=^#* *\(OLFS_CONFIG_DIR\)\=.*\$=\1\=${olfs_config_dir}=" \
+      -- "$tomcat_sysconfig"
+
+  if [ ! -r "$olfs_config_dir"/olfs.xml ] ; then
+    install -v -o tomcat -g tomcat -m 0775 -d "$tomcat_content_dir" "$olfs_config_dir"
+    systemctl start tomcat@"$tomcat_instance_name".service
+    local count=0 delay=30
+    while [ "$count" -lt 5 -a ! -r "$olfs_config_dir"/olfs.xml ] ; do
+      let ++count
+      echo "Waiting $delay seconds (pass $count) for ${olfs_config_dir}/olfs.xml ..."
+      sleep "$delay"
+    done
+    if [ ! -r "$olfs_config_dir"/olfs.xml ] ; then
+      echo >&2 "OLFS config file never appeared: ${olfs_config_dir}/olfs.xml"
+      exit 1
+    fi
+    systemctl stop tomcat@"$tomcat_instance_name".service
+  fi
+
+  xmlstarlet ed \
+      --inplace \
+      -u 'OLFSConfig/BESManager/BES/port' -v "$bes_instance_port" \
+      "$olfs_config_dir"/olfs.xml
+}
+
+
+main
